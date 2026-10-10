@@ -1,385 +1,574 @@
 <?php
 /**
- * fines.php - Late fine report and payment collection
- * Search by student or book, filter by payment state, take payments.
+ * fines.php - Late-return fine engine
+ *
+ * The single source of truth for every fine number in the system.
+ * Loaded automatically through includes/functions.php.
+ *
+ * Design notes
+ * ------------
+ * 1. All maths is DATE-ONLY. Dates are read as calendar days at midnight and
+ *    compared with DateTime::diff(), so the time of day can never add a day
+ *    and a DST change can never shorten or lengthen a month.
+ * 2. The fine for a book that is still out is calculated on the fly and is
+ *    NEVER written to the database. Reading a record a hundred times returns
+ *    the same number and changes nothing.
+ * 3. The fine is written to the database exactly once, inside the return
+ *    transaction, guarded by status = 'issued'. A book therefore cannot be
+ *    fined twice.
  */
-require_once __DIR__ . '/../includes/auth.php';
-require_once __DIR__ . '/../includes/functions.php';
-require_once __DIR__ . '/../includes/db.php';
-require_login();
+
+require_once __DIR__ . '/db.php';
 
 /* ============================================================
-   POST: collect a payment (full or partial)
+   CONFIGURATION
    ============================================================ */
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'pay') {
-    check_csrf();
 
-    $loan_id = int_param($_POST['issued_book_id'] ?? 0);
-    $settle  = !empty($_POST['settle']);                 // "Mark as Paid" button
-    $method  = $_POST['payment_method'] ?? 'Cash';
-    $note    = str_param($_POST['note'] ?? '', 255);
-
-    // A crafted POST must not be able to crash the payment path
-    $amount = is_scalar($_POST['amount'] ?? null) ? (float) $_POST['amount'] : 0.0;
-
-    if (!in_array($method, ['Cash', 'Card', 'UPI', 'Online'], true)) {
-        $method = 'Cash';
+/**
+ * Current fine settings, cached for the request.
+ * Missing rows fall back to the documented defaults:
+ * Rs 5 per day, fines enabled, 0 grace days, no maximum.
+ *
+ * Pass true to force a re-read, which is what save_fine_settings() does so a
+ * page that saves the settings immediately shows the new values.
+ */
+function fine_settings($refresh = false)
+{
+    static $cfg = null;
+    if ($cfg !== null && !$refresh) {
+        return $cfg;
     }
 
-    $result = record_fine_payment($loan_id, $amount, $method, $note ?: null, $settle);
+    $values = [];
+    foreach (db_all('SELECT setting_key, setting_value FROM settings') as $row) {
+        $values[$row['setting_key']] = $row['setting_value'];
+    }
 
-    flash($result['ok'] ? 'success' : 'danger', $result['message']);
+    $cfg = [
+        'enabled'    => !array_key_exists('fine_enabled', $values) || (int) $values['fine_enabled'] === 1,
+        'per_day'    => array_key_exists('fine_per_day', $values)    ? (float) $values['fine_per_day']    : 5.00,
+        'grace_days' => array_key_exists('fine_grace_days', $values) ? (int) $values['fine_grace_days'] : 0,
+        'max_amount' => array_key_exists('fine_max_amount', $values) ? (float) $values['fine_max_amount'] : 0.00,
+    ];
 
-    // Keep the librarian where they were
-    $back = 'fines.php';
-    foreach (['q', 'status'] as $key) {
-        $v = str_param($_POST[$key] ?? '', 100);
-        if ($v !== '') {
-            $back .= '&' . $key . '=' . urlencode($v);
+    return $cfg;
+}
+
+/** True when fines are switched on. */
+function fines_enabled()
+{
+    return fine_settings()['enabled'];
+}
+
+/* ============================================================
+   DATE MATHS
+   ============================================================ */
+
+/** Parse a date-only string safely. Returns null when unusable. */
+function fine_parse_date($date)
+{
+    if (empty($date) || $date === '0000-00-00') {
+        return null;
+    }
+    // "Y-m-d H:i:s" and "Y-m-d" both land on midnight, which is what we want
+    try {
+        return (new DateTimeImmutable(substr((string) $date, 0, 10)))->setTime(0, 0);
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
+/**
+ * How many days late a book is.
+ *
+ * $due_date     the due date the librarian set when issuing
+ * $returned_at  actual return date, or null/'' while the book is still out
+ *
+ * Counting starts the DAY AFTER the due date, so returning on the due date
+ * gives 0 days and therefore no fine.
+ */
+function fine_overdue_days($due_date, $returned_at = null)
+{
+    $due = fine_parse_date($due_date);
+    if ($due === null) {
+        return 0;
+    }
+
+    // Book still out: measure up to today
+    $end = $returned_at ? fine_parse_date($returned_at) : new DateTimeImmutable('today');
+    if ($end === null) {
+        return 0;
+    }
+
+    if ($end <= $due) {
+        return 0; // returned on time, or not due yet
+    }
+
+    // ->days is a true calendar-day count, so month ends, leap years and
+    // daylight-saving shifts are all handled correctly.
+    return (int) $due->diff($end)->days;
+}
+
+/* ============================================================
+   FINE CALCULATION
+   ============================================================ */
+
+/**
+ * Work out the fine for one loan.
+ *
+ * Fine = overdue days x rate per day, then the grace period is deducted and
+ * the optional cap is applied.
+ *
+ * @return array{overdue_days:int, chargeable_days:int, fine:float, rate:float,
+ *               grace:int, capped:bool, enabled:bool}
+ */
+function calculate_fine($due_date, $returned_at = null)
+{
+    $cfg        = fine_settings();
+    $overdue    = fine_overdue_days($due_date, $returned_at);
+    $chargeable = max(0, $overdue - $cfg['grace_days']);
+
+    $fine   = 0.0;
+    $capped = false;
+
+    if ($cfg['enabled'] && $chargeable > 0) {
+        $fine = round($chargeable * $cfg['per_day'], 2);
+
+        // max_amount of 0 (or less) means "no limit"
+        if ($cfg['max_amount'] > 0 && $fine > $cfg['max_amount']) {
+            $fine   = round($cfg['max_amount'], 2);
+            $capped = true;
         }
     }
-    redirect($back);
-}
 
-/* ============================================================
-   FILTERS
-   ============================================================ */
-$q      = str_param($_GET['q'] ?? '', 100);
-$status = str_param($_GET['status'] ?? 'all', 20);
-if (!in_array($status, ['all', 'pending', 'unpaid', 'partial', 'paid', 'none', 'overdue', 'live'], true)) {
-    $status = 'all';
-}
-
-$sql = "SELECT ib.*, b.title, b.author, b.isbn,
-               s.name AS student_name, s.email AS student_email, s.phone AS student_phone
-          FROM issued_books ib
-          JOIN books b    ON b.id = ib.book_id
-          JOIN students s ON s.id = ib.student_id";
-
-$params = [];
-
-if ($q !== '') {
-    // Search across student AND book details in one box
-    $sql     .= ' WHERE (s.name LIKE ? OR s.email LIKE ? OR s.phone LIKE ?
-                         OR b.title LIKE ? OR b.author LIKE ? OR b.isbn LIKE ?
-                         OR CAST(ib.book_id AS CHAR) = ?)';
-    $like     = '%' . $q . '%';
-    $params[] = $like; $params[] = $like; $params[] = $like;
-    $params[] = $like; $params[] = $like; $params[] = $like;
-    $params[] = $q;
-}
-
-// Payment-state filters run on the stored columns (returned loans are final).
-// Loans that are still out are NOT in those columns yet: their fine is accruing
-// live and fine_status is still 'none', so they must be matched on the due date
-// instead, otherwise these filters would silently hide money that is owed.
-switch ($status) {
-    case 'unpaid':
-        $sql .= " AND ((ib.status = 'returned' AND ib.fine_status = 'unpaid')
-                       OR (ib.status = 'issued'    AND ib.return_date < CURDATE()))";
-        break;
-    case 'partial': $sql .= " AND ib.status = 'returned' AND ib.fine_status = 'partial'"; break;
-    case 'paid':    $sql .= " AND ib.status = 'returned' AND ib.fine_status = 'paid'";    break;
-    case 'none':    $sql .= " AND ib.status = 'returned' AND ib.fine_status = 'none'";    break;
-    case 'pending':
-        // "Anything unpaid" = a returned loan with a balance left, or a book that
-        // is still out and already past its due date.
-        $sql .= " AND ((ib.status = 'returned' AND ib.fine_amount > ib.fine_paid)
-                       OR (ib.status = 'issued'    AND ib.return_date < CURDATE()))";
-        break;
-    case 'overdue': $sql .= " AND ib.status = 'issued' AND ib.return_date < CURDATE()";   break;
-    case 'live':    $sql .= " AND ib.status = 'issued'";                                   break;
-}
-
-// These filters are about money owed, so the exact figure is worked out in PHP
-// and rows that come to nil (e.g. still inside the grace period) are dropped.
-$money_only = ($status === 'pending' || $status === 'unpaid');
-
-$sql .= ' ORDER BY ib.return_date ASC, ib.id ASC';
-$loans = db_all($sql, $params);
-
-/* ============================================================
-   WORK OUT EVERY FINE FOR THE RESULT SET
-   ============================================================ */
-$rows = [];
-$t_display = ['assessed' => 0.0, 'collected' => 0.0, 'pending' => 0.0, 'late' => 0];
-
-foreach ($loans as $l) {
-    $f = loan_fine($l);
-
-    if ($money_only && $f['remaining'] <= 0) {
-        continue;
-    }
-
-    $l['fine'] = $f;                 // attach for the template
-    $rows[]    = $l;
-
-    $t_display['assessed']  += $f['amount'];
-    $t_display['collected'] += $f['paid'];
-    $t_display['pending']   += $f['remaining'];
-    if ($f['days'] > 0) {
-        $t_display['late']++;
-    }
-}
-
-foreach ($t_display as $k => $v) {
-    $t_display[$k] = is_int($v) ? $v : round($v, 2);
-}
-
-// Overall figures across the whole library, independent of the filter
-$overall = fines_summary();
-$cfg     = fine_settings();
-
-/* ============================================================
-   PAGE
-   ============================================================ */
-$current_page  = 'fines.php';
-$page_title    = 'Fines & Payments';
-$page_subtitle = 'Late return fines at ' . rupees($cfg['per_day']) . ' per day'
-               . ($cfg['enabled'] ? '' : ' - FINES CURRENTLY DISABLED')
-               . ($cfg['grace_days'] > 0 ? ' (after ' . $cfg['grace_days'] . ' grace day(s))' : '')
-               . ($cfg['max_amount'] > 0 ? ' (capped at ' . rupees($cfg['max_amount']) . ')' : '');
-$page_actions  = '<a href="fine_settings.php" class="btn btn-outline-secondary btn-sm">'
-               . '<i class="bi bi-gear me-1"></i> Fine Settings</a>'
-               . '<button type="button" onclick="window.print()" class="btn btn-outline-secondary btn-sm">'
-               . '<i class="bi bi-printer me-1"></i> Print</button>';
-
-require_once __DIR__ . '/../includes/header.php';
-?>
-
-<?php if (!$cfg['enabled']): ?>
-    <div class="alert alert-warning d-flex align-items-center gap-2">
-        <i class="bi bi-exclamation-triangle-fill"></i>
-        <div class="flex-grow-1">Fine collection is switched <strong>off</strong>. Fines already
-            assessed are kept, but no new fine is being charged.</div>
-        <a href="fine_settings.php" class="btn btn-sm btn-primary">Turn on</a>
-    </div>
-<?php endif; ?>
-
-<!-- ===================== SUMMARY CARDS ===================== -->
-<div class="row g-3 mb-4">
-    <?php
-    $cards = [
-        ['Total Assessed',  $overall['assessed'],  'cash-stack',      '#2563eb', 'All fines raised'],
-        ['Total Collected', $overall['collected'], 'check-circle',    '#16a34a', 'Payments received'],
-        ['Total Pending',   $overall['pending'],   'hourglass-split', '#dc2626', 'Still to be collected'],
-        ['Overdue Books',   $overall['overdue'],   'exclamation-triangle', '#f59e0b', 'Fine accruing now'],
+    return [
+        'overdue_days'   => $overdue,
+        'chargeable_days'=> $chargeable,
+        'fine'           => $fine,
+        'rate'           => $cfg['per_day'],
+        'grace'          => $cfg['grace_days'],
+        'capped'         => $capped,
+        'enabled'        => $cfg['enabled'],
     ];
-    foreach ($cards as $c): ?>
-        <div class="col-6 col-lg-3">
-            <div class="card stat-card h-100" style="--stat-color:<?= $c[3] ?>">
-                <div class="card-body d-flex align-items-center gap-3">
-                    <span class="stat-icon"><i class="bi bi-<?= $c[2] ?>"></i></span>
-                    <div>
-                        <div class="stat-value"><?= is_int($c[1]) ? $c[1] : rupees($c[1]) ?></div>
-                        <div class="stat-label"><?= e($c[0]) ?></div>
-                        <div class="small text-muted"><?= e($c[4]) ?></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    <?php endforeach; ?>
-</div>
+}
 
-<!-- ===================== FILTERS ===================== -->
-<div class="card mb-3">
-    <div class="card-body">
-        <form method="get" class="row g-2 align-items-end">
-            <div class="col-12 col-md-6 col-lg-5">
-                <label class="form-label" for="q"><i class="bi bi-search me-1"></i>Search</label>
-                <input type="search" class="form-control" id="q" name="q" value="<?= e($q) ?>"
-                       placeholder="Student name, email, phone, book title, ISBN or book ID...">
-            </div>
-            <div class="col-8 col-md-4 col-lg-3">
-                <label class="form-label" for="status">Fine Status</label>
-                <select class="form-select" id="status" name="status">
-                    <option value="all"     <?= $status === 'all' ? 'selected' : '' ?>>All records</option>
-                    <option value="pending" <?= $status === 'pending' ? 'selected' : '' ?>>Pending (anything unpaid)</option>
-                    <option value="unpaid"  <?= $status === 'unpaid' ? 'selected' : '' ?>>Unpaid</option>
-                    <option value="partial" <?= $status === 'partial' ? 'selected' : '' ?>>Partially Paid</option>
-                    <option value="paid"    <?= $status === 'paid' ? 'selected' : '' ?>>Paid</option>
-                    <option value="none"    <?= $status === 'none' ? 'selected' : '' ?>>No Fine (on time)</option>
-                    <option value="overdue" <?= $status === 'overdue' ? 'selected' : '' ?>>Overdue (still out)</option>
-                    <option value="live"    <?= $status === 'live' ? 'selected' : '' ?>>Still issued</option>
-                </select>
-            </div>
-            <div class="col-4 col-md-2 col-lg-2 d-grid">
-                <button type="submit" class="btn btn-primary"><i class="bi bi-funnel me-1"></i> Filter</button>
-            </div>
-            <div class="col-12 col-lg-2 d-grid">
-                <a href="fines.php" class="btn btn-outline-secondary">Clear</a>
-            </div>
-        </form>
-    </div>
-</div>
+/**
+ * Fine for a loan, using the value already stored when the book is back and
+ * a live calculation while it is still out.
+ *
+ * @return array{days:int, amount:float, paid:float, remaining:float,
+ *               status:string, label:string, css:string, live:bool}
+ */
+function loan_fine(array $loan)
+{
+    $returned = ($loan['status'] ?? '') === 'returned';
+    $isBack   = $returned && !empty($loan['returned_at']);
 
-<!-- ===================== FINE TABLE ===================== -->
-<div class="card">
-    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
-        <span><i class="bi bi-cash-coin me-2"></i>Fine Records</span>
-        <div class="d-flex flex-wrap gap-2">
-            <span class="badge text-bg-secondary"><?= count($rows) ?> record(s)</span>
-            <span class="badge text-bg-primary">Shown assessed: <?= rupees($t_display['assessed']) ?></span>
-            <span class="badge text-bg-danger">Shown pending: <?= rupees($t_display['pending']) ?></span>
-        </div>
-    </div>
+    if ($isBack) {
+        // Frozen figures: re-reading them can never change them.
+        // Defaults keep this safe for callers that select only some columns.
+        $days   = (int) ($loan['fine_days']   ?? 0);
+        $amount = (float) ($loan['fine_amount'] ?? 0);
+        $paid   = (float) ($loan['fine_paid']   ?? 0);
+        $live   = false;
+    } else {
+        $calc   = calculate_fine($loan['return_date'] ?? null, null);
+        $days   = $calc['overdue_days'];
+        $amount = $calc['fine'];
+        $paid   = 0.0; // nothing is collected before the book comes back
+        $live   = true;
+    }
 
-    <div class="table-responsive">
-        <table class="table table-hover align-middle mb-0">
-            <thead>
-                <tr>
-                    <th>Student / Member</th>
-                    <th>Book</th>
-                    <th>Book ID</th>
-                    <th>Issued</th>
-                    <th>Due Date</th>
-                    <th>Returned</th>
-                    <th class="text-center">Overdue Days</th>
-                    <th class="text-end">Fine</th>
-                    <th class="text-end">Paid</th>
-                    <th class="text-end">Remaining</th>
-                    <th>Fine Status</th>
-                    <th class="text-end">Action</th>
-                </tr>
-            </thead>
-            <tbody>
-            <?php if (!$rows): ?>
-                <tr><td colspan="12" class="empty-state">
-                    <i class="bi bi-inbox"></i>No fine records match this search.
-                </td></tr>
-            <?php endif; ?>
+    $remaining = round($amount - $paid, 2);
+    if ($remaining < 0) {          // guard against an over-payment
+        $remaining = 0.0;
+        $paid      = $amount;
+    }
 
-            <?php foreach ($rows as $r):
-                $f   = $r['fine'];
-                $out = $f['days'] > 0;
-                ?>
-                <tr<?= $out ? ' class="table-warning"' : '' ?>>
-                    <td>
-                        <a href="student_fines.php?id=<?= (int) $r['student_id'] ?>" class="fw-semibold text-decoration-none">
-                            <?= e($r['student_name']) ?></a>
-                        <div class="small text-muted"><?= e($r['student_email']) ?></div>
-                    </td>
-                    <td>
-                        <div class="text-truncate-2"><?= e($r['title']) ?></div>
-                        <div class="small text-muted"><?= e($r['author']) ?></div>
-                    </td>
-                    <td class="small text-muted">#<?= (int) $r['book_id'] ?></td>
-                    <td class="small"><?= fmt_date($r['issue_date']) ?></td>
-                    <td class="small"><?= fmt_date($r['return_date']) ?></td>
-                    <td class="small">
-                        <?php if (!empty($r['returned_at'])): ?>
-                            <?= fmt_date($r['returned_at']) ?>
-                        <?php else: ?>
-                            <span class="text-muted">Not returned</span>
-                        <?php endif; ?>
-                    </td>
-                    <td class="text-center">
-                        <?php if ($out): ?>
-                            <span class="badge text-bg-danger"><?= $f['days'] ?></span>
-                        <?php else: ?>
-                            <span class="text-muted">0</span>
-                        <?php endif; ?>
-                    </td>
-                    <td class="text-end fw-semibold"><?= rupees($f['amount']) ?></td>
-                    <td class="text-end text-success"><?= rupees($f['paid']) ?></td>
-                    <td class="text-end fw-semibold <?= $f['remaining'] > 0 ? 'text-danger' : 'text-muted' ?>">
-                        <?= rupees($f['remaining']) ?>
-                    </td>
-                    <td><?= fine_badge($f['label'], $f['css']) ?></td>
-                    <td class="text-end text-nowrap">
-                        <?php if ($f['live']): ?>
-                            <span class="badge text-bg-info" title="Calculated live until the book is returned">
-                                <?= $f['amount'] > 0 ? 'Accruing' : 'On loan' ?>
-                            </span>
-                        <?php elseif ($f['remaining'] > 0): ?>
-                            <button class="btn btn-sm btn-success" type="button"
-                                    data-bs-toggle="collapse" data-bs-target="#pay<?= (int) $r['id'] ?>"
-                                    aria-expanded="false" aria-controls="pay<?= (int) $r['id'] ?>" title="Collect payment">
-                                <i class="bi bi-cash"></i> Pay
-                            </button>
-                        <?php else: ?>
-                            <span class="text-muted small">Settled</span>
-                        <?php endif; ?>
-                    </td>
-                </tr>
+    [$status, $label, $css] = fine_status_parts($amount, $paid);
 
-                <!-- Collapsible payment form -->
-                <?php if (!$f['live'] && $f['remaining'] > 0): ?>
-                <tr class="collapse" id="pay<?= (int) $r['id'] ?>">
-                    <td colspan="12" class="bg-light">
-                        <form method="post" class="row g-2 align-items-end">
-                            <?= csrf_field() ?>
-                            <input type="hidden" name="action" value="pay">
-                            <input type="hidden" name="issued_book_id" value="<?= (int) $r['id'] ?>">
-                            <input type="hidden" name="q" value="<?= e($q) ?>">
-                            <input type="hidden" name="status" value="<?= e($status) ?>">
+    return [
+        'days'      => $days,
+        'amount'    => round($amount, 2),
+        'paid'      => round($paid, 2),
+        'remaining' => $remaining,
+        'status'    => $status,
+        'label'     => $label,
+        'css'       => $css,
+        'live'      => $live,
+    ];
+}
 
-                            <div class="col-6 col-md-3">
-                                <label class="form-label">Outstanding</label>
-                                <div class="form-control-plaintext fw-bold text-danger">
-                                    <?= rupees($f['remaining']) ?>
-                                </div>
-                            </div>
-                            <div class="col-6 col-md-2">
-                                <label class="form-label" for="amt<?= (int) $r['id'] ?>">Amount received</label>
-                                <input type="number" step="0.01" min="0.01"
-                                       max="<?= e($f['remaining']) ?>"
-                                       class="form-control form-control-sm" id="amt<?= (int) $r['id'] ?>"
-                                       name="amount" value="<?= e($f['remaining']) ?>" required>
-                            </div>
-                            <div class="col-6 col-md-2">
-                                <label class="form-label">Method</label>
-                                <select class="form-select form-select-sm" name="payment_method">
-                                    <option>Cash</option><option>Card</option>
-                                    <option>UPI</option><option>Online</option>
-                                </select>
-                            </div>
-                            <div class="col-6 col-md-3">
-                                <label class="form-label">Note</label>
-                                <input type="text" class="form-control form-control-sm" name="note"
-                                       placeholder="Optional">
-                            </div>
-                            <div class="col-12 col-md-2 d-flex gap-2">
-                                <button type="submit" name="settle" value="1"
-                                        class="btn btn-sm btn-success flex-grow-1" title="Collect the full balance">
-                                    <i class="bi bi-check-lg"></i> Settle
-                                </button>
-                                <button type="submit" class="btn btn-sm btn-primary flex-grow-1">
-                                    Add
-                                </button>
-                            </div>
-                        </form>
-                        <div class="small text-muted mt-1">
-                            <i class="bi bi-info-circle me-1"></i>
-                            "Add" records exactly the amount typed (for a part payment).
-                            "Settle" collects the whole <?= rupees($f['remaining']) ?> balance.
-                        </div>
-                    </td>
-                </tr>
-                <?php endif; ?>
-            <?php endforeach; ?>
-            </tbody>
+/**
+ * Derive the payment state.
+ * @return array{0:string,1:string,2:string} status key, label, badge css
+ */
+function fine_status_parts($amount, $paid)
+{
+    $amount    = round((float) $amount, 2);
+    $paid      = round((float) $paid, 2);
+    $remaining = round($amount - $paid, 2);
 
-            <?php if ($rows): ?>
-            <tfoot class="table-light">
-                <tr class="fw-semibold">
-                    <td colspan="7">Totals for this view</td>
-                    <td class="text-end"><?= rupees($t_display['assessed']) ?></td>
-                    <td class="text-end text-success"><?= rupees($t_display['collected']) ?></td>
-                    <td class="text-end text-danger"><?= rupees($t_display['pending']) ?></td>
-                    <td colspan="3" class="small text-muted"><?= $t_display['late'] ?> late record(s)</td>
-                </tr>
-            </tfoot>
-            <?php endif; ?>
-        </table>
-    </div>
+    if ($amount <= 0) {
+        return ['none', 'No Fine', 'success'];        // on time / nothing owed
+    }
+    if ($remaining <= 0) {
+        return ['paid', 'Paid', 'success'];           // settled in full
+    }
+    if ($paid > 0) {
+        return ['partial', 'Partially Paid', 'warning'];
+    }
+    return ['unpaid', 'Unpaid', 'danger'];            // nothing collected yet
+}
 
-    <div class="card-footer bg-white small text-muted">
-        <i class="bi bi-info-circle me-1"></i>
-        Rows marked <span class="badge text-bg-warning">warning</span> are late.
-        A fine is worked out once when the book is returned and then frozen;
-        for books still out the figure shown is recalculated live and is not stored.
-    </div>
-</div>
+/* ============================================================
+   DISPLAY HELPERS
+   ============================================================ */
 
-<?php require_once __DIR__ . '/../includes/footer.php'; ?>
+/**
+ * 1234.5 -> ₹ 1,234.50
+ *
+ * Returns the real rupee character rather than an HTML entity, so the result is
+ * safe whether it is echoed raw into markup or passed through e().
+ */
+function rupees($amount)
+{
+    return "\u{20B9}" . number_format((float) $amount, 2);
+}
+
+/** Plain text rupee amount (no HTML) - for flash messages. */
+function rupees_text($amount)
+{
+    return 'Rs ' . number_format((float) $amount, 2);
+}
+
+/** Coloured badge showing the payment state. */
+function fine_badge($label, $css)
+{
+    return '<span class="badge text-bg-' . $css . '">' . e($label) . '</span>';
+}
+
+/**
+ * Sentence used in the dashboard notification strip.
+ * Written for the librarian's view, so it names the student who has the book.
+ */
+function fine_notification_text($student_name, $title, $overdue_days, $fine_amount, $rate)
+{
+    return sprintf(
+        "%s has had '%s' %d day%s overdue. Fine accrued so far: %s (Rs %s per day).",
+        rtrim($student_name) . "'s copy",
+        $title,
+        $overdue_days,
+        $overdue_days === 1 ? '' : 's',
+        rupees_text($fine_amount),
+        number_format((float) $rate, 2)
+    );
+}
+
+/* ============================================================
+   AGGREGATES
+   ============================================================ */
+
+/**
+ * Headline fine figures for the dashboard and reports.
+ * Returned-book fines come from the stored values; books still out are
+ * included at their live accrued value.
+ */
+function fines_summary()
+{
+    $back = db_one(
+        "SELECT COALESCE(SUM(fine_amount), 0) AS assessed,
+                COALESCE(SUM(fine_paid), 0)   AS collected,
+                COALESCE(SUM(fine_amount - fine_paid), 0) AS pending
+           FROM issued_books
+          WHERE status = 'returned'"
+    );
+
+    $live = calculate_live_fines();
+
+    return [
+        'assessed'  => round((float) $back['assessed'] + $live['assessed'], 2),
+        'collected' => round((float) $back['collected'], 2),
+        'pending'   => round((float) $back['pending'] + $live['pending'], 2),
+        'overdue'   => $live['overdue_count'],
+        'accruing'  => $live['accruing_count'],
+    ];
+}
+
+/**
+ * Sum the live fines on books that are still out, in one pass.
+ * Kept separate so fines_summary() stays a single cheap query.
+ */
+function calculate_live_fines()
+{
+    $rows = db_all(
+        "SELECT ib.id, ib.return_date, ib.fine_amount
+           FROM issued_books ib
+          WHERE ib.status = 'issued'"
+    );
+
+    $assessed = $pending = 0.0;
+    $overdue_count = $accruing_count = 0;
+
+    foreach ($rows as $row) {
+        $calc  = calculate_fine($row['return_date'], null);
+        $days  = $calc['overdue_days'];
+
+        if ($days > 0) {
+            $overdue_count++;
+            if ($calc['fine'] > 0) {
+                $assessed += $calc['fine'];
+                $pending  += $calc['fine'];
+                $accruing_count++;
+            }
+        }
+    }
+
+    return [
+        'assessed'       => round($assessed, 2),
+        'pending'        => round($pending, 2),
+        'overdue_count'  => $overdue_count,
+        'accruing_count' => $accruing_count,
+    ];
+}
+
+/**
+ * Fine totals for one student.
+ */
+function student_fine_summary($student_id)
+{
+    $back = db_one(
+        "SELECT COALESCE(SUM(fine_amount), 0) AS assessed,
+                COALESCE(SUM(fine_paid), 0)   AS collected,
+                COALESCE(SUM(fine_amount - fine_paid), 0) AS pending
+           FROM issued_books
+          WHERE student_id = ? AND status = 'returned'",
+        [$student_id]
+    );
+
+    $out = db_all(
+        "SELECT return_date FROM issued_books WHERE student_id = ? AND status = 'issued'",
+        [$student_id]
+    );
+
+    $live_pending = 0.0;
+    $overdue      = 0;
+    foreach ($out as $row) {
+        $calc = calculate_fine($row['return_date'], null);
+        if ($calc['overdue_days'] > 0) {
+            $overdue++;
+            $live_pending += $calc['fine'];
+        }
+    }
+
+    return [
+        'assessed'  => round((float) $back['assessed'] + $live_pending, 2),
+        'collected' => round((float) $back['collected'], 2),
+        'pending'   => round((float) $back['pending'] + $live_pending, 2),
+        'overdue'   => $overdue,
+    ];
+}
+
+/**
+ * Fine totals for many students in a fixed number of queries.
+ *
+ * student_fine_summary() costs two queries, so calling it once per row of a
+ * list page turns into 1 + 2N queries. This does the whole page in three.
+ *
+ * @param  array $student_ids
+ * @return array [student_id => same shape as student_fine_summary()]
+ */
+function student_fine_summaries(array $student_ids)
+{
+    $student_ids = array_values(array_unique(array_map('intval', $student_ids)));
+    $out = [];
+    foreach ($student_ids as $id) {
+        $out[$id] = ['assessed' => 0.0, 'collected' => 0.0, 'pending' => 0.0, 'overdue' => 0];
+    }
+    if (!$student_ids) {
+        return $out;
+    }
+
+    $in = implode(',', array_fill(0, count($student_ids), '?'));
+
+    // 1. Stored fines on books already returned
+    $returned = db_all(
+        "SELECT student_id,
+                COALESCE(SUM(fine_amount), 0)          AS assessed,
+                COALESCE(SUM(fine_paid), 0)            AS collected,
+                COALESCE(SUM(fine_amount - fine_paid), 0) AS pending
+           FROM issued_books
+          WHERE status = 'returned' AND student_id IN ($in)
+          GROUP BY student_id",
+        $student_ids
+    );
+
+    foreach ($returned as $r) {
+        $id = (int) $r['student_id'];
+        if (isset($out[$id])) {
+            $out[$id]['assessed']  = (float) $r['assessed'];
+            $out[$id]['collected'] = (float) $r['collected'];
+            $out[$id]['pending']   = (float) $r['pending'];
+        }
+    }
+
+    // 2. Books still out, whose fines are accrued live
+    $live = db_all(
+        "SELECT student_id, return_date
+           FROM issued_books
+          WHERE status = 'issued' AND student_id IN ($in)",
+        $student_ids
+    );
+
+    foreach ($live as $r) {
+        $id = (int) $r['student_id'];
+        if (!isset($out[$id])) {
+            continue;
+        }
+        $calc = calculate_fine($r['return_date'], null);
+        if ($calc['overdue_days'] > 0) {
+            $out[$id]['overdue']++;
+            $out[$id]['assessed'] += $calc['fine'];
+            $out[$id]['pending']   += $calc['fine'];
+        }
+    }
+
+    foreach ($out as $id => $v) {
+        $out[$id]['assessed']  = round($v['assessed'], 2);
+        $out[$id]['collected'] = round($v['collected'], 2);
+        $out[$id]['pending']   = round($v['pending'], 2);
+    }
+
+    return $out;
+}
+
+/* ============================================================
+   WRITES
+   ============================================================ */
+
+/**
+ * Assess and store the final fine for a book being returned.
+ * MUST be called inside the return transaction, while the row is still
+ * status = 'issued'.
+ *
+ * The UPDATE is guarded by status = 'issued'. That guard is what makes the fine
+ * a genuinely one-time event: a loan that has already been returned is never
+ * re-assessed, so its collected amount can never be reset to 0 by a second call.
+ *
+ * @return array the fine numbers plus 'assessed' (bool), for the flash message
+ */
+function save_fine_on_return($issued_book_id, $due_date, $returned_at)
+{
+    $calc = calculate_fine($due_date, $returned_at);
+    [$status] = fine_status_parts($calc['fine'], 0.0);
+
+    $stmt = db_query(
+        "UPDATE issued_books
+            SET fine_days = ?, fine_amount = ?, fine_paid = 0.00, fine_status = ?
+          WHERE id = ? AND status = 'issued'",
+        [$calc['overdue_days'], $calc['fine'], $status, $issued_book_id]
+    );
+
+    // rowCount() of 0 means the loan was not 'issued', so nothing was written.
+    $calc['assessed'] = ($stmt->rowCount() === 1);
+
+    return $calc;
+}
+
+/**
+ * Record a payment against a fine and move its status on.
+ *
+ * @param float  $amount   money being handed over now
+ * @param string $method   Cash / Card / UPI / Online
+ * @param string $note     optional note
+ * @param bool   $settle   true = pay whatever is outstanding
+ * @return array{ok:bool, message:string}
+ */
+function record_fine_payment($issued_book_id, $amount, $method = 'Cash', $note = null, $settle = false)
+{
+    $pdo = db();
+
+    try {
+        $pdo->beginTransaction();
+
+        // Lock the row so two librarians cannot both read the same fine_paid
+        // and one payment overwrite the other.
+        $loan = db_one(
+            "SELECT * FROM issued_books WHERE id = ? AND status = 'returned' FOR UPDATE",
+            [$issued_book_id]
+        );
+
+        if (!$loan) {
+            $pdo->rollBack();
+            return ['ok' => false, 'message' => 'That loan is not available for payment.'];
+        }
+
+    $amount      = round((float) $amount, 2);
+    $outstanding = round((float) $loan['fine_amount'] - (float) $loan['fine_paid'], 2);
+
+    // The columns are narrow, so never let a crafted value reach the INSERT
+    $method = in_array($method, ['Cash', 'Card', 'UPI', 'Online'], true) ? $method : 'Cash';
+    $note   = ($note === null || $note === '') ? null : str_param($note, 255);
+
+        if ($outstanding <= 0) {
+            $pdo->rollBack();
+            return ['ok' => false, 'message' => 'This fine is already fully paid.'];
+        }
+
+        // "Mark as paid" hands over the whole outstanding balance
+        if ($settle) {
+            $amount = $outstanding;
+        }
+
+        if ($amount <= 0) {
+            $pdo->rollBack();
+            return ['ok' => false, 'message' => 'Enter a payment amount greater than zero.'];
+        }
+        if ($amount > $outstanding) {
+            $pdo->rollBack();
+            return ['ok' => false, 'message' => 'Payment cannot be more than the outstanding ' . rupees_text($outstanding) . '.'];
+        }
+
+        db_query(
+            'INSERT INTO fine_payments (issued_book_id, amount, payment_date, payment_method, note)
+             VALUES (?, ?, CURDATE(), ?, ?)',
+            [$issued_book_id, $amount, $method, $note]
+        );
+
+        $new_paid = round((float) $loan['fine_paid'] + $amount, 2);
+
+        // fine_status is an ENUM, so store the status KEY, not the label
+        [$status, $label] = fine_status_parts((float) $loan['fine_amount'], $new_paid);
+
+        db_query('UPDATE issued_books SET fine_paid = ?, fine_status = ? WHERE id = ?',
+                 [$new_paid, $status, $issued_book_id]);
+
+        $pdo->commit();
+
+        return ['ok' => true, 'message' => 'Collected ' . rupees_text($amount) . '. Fine is now ' . $label . '.'];
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        return ['ok' => false, 'message' => 'Payment failed: ' . $e->getMessage()];
+    }
+}
+
+/** Update the fine configuration from the settings form. */
+function save_fine_settings($per_day, $enabled, $grace_days, $max_amount)
+{
+    $values = [
+        'fine_per_day'    => number_format((float) $per_day, 2),
+        'fine_enabled'    => $enabled ? '1' : '0',
+        'fine_grace_days' => (string) (int) $grace_days,
+        'fine_max_amount' => number_format((float) $max_amount, 2),
+    ];
+
+    foreach ($values as $key => $value) {
+        // REPLACE keeps this working whether or not the row already exists
+        db_query('REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)', [$key, $value]);
+    }
+
+    // Drop the cached copy so this request sees what was just saved
+    fine_settings(true);
+}
