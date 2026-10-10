@@ -1,0 +1,264 @@
+/* ============================================================
+   Library Management System - custom styles on top of Bootstrap 5
+   ============================================================ */
+
+:root {
+    --lms-sidebar-w: 250px;
+    --lms-navbar-h: 58px;
+    --lms-primary: #1e40af;
+    --lms-bg: #f4f6fb;
+    --lms-border: #e5e7eb;
+}
+
+/* ---------- Base ---------- */
+body {
+    background-color: var(--lms-bg);
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+    font-size: .95rem;
+}
+
+/* ---------- Top navbar ---------- */
+.app-navbar {
+    background: linear-gradient(90deg, #172554 0%, var(--lms-primary) 60%, #2563eb 100%);
+    min-height: var(--lms-navbar-h);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .12);
+}
+.app-navbar .navbar-brand { color: #fff; }
+.app-navbar .navbar-brand:hover { color: #dbeafe; }
+
+.brand-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, .15);
+}
+
+/* ---------- Layout ---------- */
+.app-layout {
+    display: flex;
+    align-items: stretch;
+    min-height: calc(100vh - var(--lms-navbar-h));
+}
+
+.app-sidebar {
+    width: var(--lms-sidebar-w);
+    flex: 0 0 var(--lms-sidebar-w);
+    background: #fff;
+    border-right: 1px solid var(--lms-border);
+    display: flex;
+    flex-direction: column;
+    position: sticky;
+    top: var(--lms-navbar-h);
+    height: calc(100vh - var(--lms-navbar-h));
+    overflow-y: auto;
+}
+.sidebar-foot { margin-top: auto; }
+
+.app-content {
+    flex: 1 1 auto;
+    min-width: 0;                 /* lets tables shrink instead of overflowing */
+    padding: 1.25rem 1.5rem 2rem;
+}
+
+/* ---------- Sidebar nav ---------- */
+.sidebar-nav .nav-link {
+    display: flex;
+    align-items: center;
+    gap: .65rem;
+    color: #475569;
+    border-radius: 8px;
+    padding: .55rem .75rem;
+    font-weight: 500;
+    white-space: nowrap;
+}
+.sidebar-nav .nav-link i { font-size: 1.05rem; width: 1.25rem; text-align: center; }
+.sidebar-nav .nav-link:hover { background: #f1f5f9; color: var(--lms-primary); }
+.sidebar-nav .nav-link.active {
+    background: var(--lms-primary);
+    color: #fff;
+    box-shadow: 0 3px 8px rgba(30, 64, 175, .3);
+}
+
+.app-offcanvas { max-width: 280px; }
+
+/* ---------- Stat cards ---------- */
+.stat-card {
+    border: 1px solid var(--lms-border);
+    border-radius: 12px;
+    background: #fff;
+    border-left: 5px solid var(--stat-color, #64748b);
+    transition: transform .15s ease, box-shadow .15s ease;
+}
+.stat-card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0, 0, 0, .08); }
+.stat-card .stat-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.4rem;
+    color: #fff;
+    background: var(--stat-color, #64748b);
+}
+.stat-card .stat-value { font-size: 1.6rem; font-weight: 700; line-height: 1.1; }
+.stat-card .stat-label { color: #64748b; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+
+/* ---------- Cards / panels ---------- */
+.card { border: 1px solid var(--lms-border); border-radius: 12px; }
+.card-header { background: #fff; border-bottom: 1px solid var(--lms-border); font-weight: 600; }
+
+/* ---------- Tables ---------- */
+.table thead th {
+    background: #f8fafc;
+    font-size: .78rem;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: #475569;
+    white-space: nowrap;
+}
+.table td { vertical-align: middle; }
+.table-hover tbody tr:hover { background: #f8fafc; }
+.table-responsive { border-radius: 0 0 12px 12px; }
+
+.table .btn { --bs-btn-padding-y: .15rem; --bs-btn-padding-x: .5rem; --bs-btn-font-size: .8rem; }
+
+/* ---------- Forms ---------- */
+.form-label { font-weight: 600; font-size: .85rem; color: #334155; }
+.form-control, .form-select { border-radius: 8px; }
+.form-control:focus, .form-select:focus {
+    border-color: #93b4fd;
+    box-shadow: 0 0 0 .2rem rgba(37, 99, 235, .15);
+}
+.form-text { font-size: .78rem; }
+
+.btn { border-radius: 8px; font-weight: 500; }
+.btn-primary { background-color: var(--lms-primary); border-color: var(--lms-primary); }
+.btn-primary:hover, .btn-primary:focus {
+    background-color: #1d4ed8; border-color: #1d4ed8;
+}
+
+/* ---------- Login page ---------- */
+.login-page {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    background: linear-gradient(135deg, #1e293b 0%, #1e40af 55%, #3b82f6 100%);
+}
+.login-card {
+    width: 100%;
+    max-width: 420px;
+    border: 0;
+    border-radius: 16px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, .3);
+}
+.login-logo {
+    width: 62px;
+    height: 62px;
+    border-radius: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.9rem;
+    color: #fff;
+    background: var(--lms-primary);
+}
+
+/* ---------- Misc ---------- */
+.empty-state { text-align: center; padding: 2.5rem 1rem; color: #94a3b8; }
+.empty-state i { font-size: 2.75rem; display: block; margin-bottom: .5rem; }
+
+/* lets flex children shrink so long titles truncate instead of stretching the row */
+.min-w-0 { min-width: 0; }
+
+.app-footer { background: #fff; border-top: 1px solid var(--lms-border); }
+
+.text-truncate-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    max-width: 260px;
+}
+
+/* ---------- Fines ---------- */
+/* notification strip on the dashboard */
+.notify-list { max-height: 340px; overflow-y: auto; }
+.notify-item { border-left: 4px solid transparent; }
+.notify-danger  { border-left-color: #dc2626; background-color: #fef2f2; }
+.notify-warning { border-left-color: #f59e0b; background-color: #fffbeb; }
+.notify-info    { border-left-color: #0ea5e9; background-color: #f0f9ff; }
+.notify-item > i { flex: 0 0 auto; }
+.notify-danger  > i { color: #dc2626; }
+.notify-warning > i { color: #f59e0b; }
+.notify-info    > i { color: #0ea5e9; }
+
+/* fine money columns line up neatly */
+.table td.text-end { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.table .text-danger.fw-semibold { white-space: nowrap; }
+
+/* a thin scrollbar for the notification list on small screens */
+.notify-list::-webkit-scrollbar { width: 6px; }
+.notify-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+/* ---------- Responsive ---------- */
+@media (max-width: 991.98px) {
+    .app-content { padding: 1rem .9rem 1.5rem; }
+}
+
+@media (max-width: 575.98px) {
+    body { font-size: .9rem; }
+    .app-content { padding: .85rem .7rem 1.25rem; }
+    h1.h3 { font-size: 1.35rem; }
+    .stat-card .stat-value { font-size: 1.35rem; }
+    .stat-card .stat-icon { width: 40px; height: 40px; font-size: 1.15rem; }
+    .card-body { padding: .9rem; }
+    .text-truncate-2 { max-width: 150px; }
+    .btn { font-size: .875rem; }
+}
+
+/* Hide horizontal scrollbars caused by wide tables on small screens */
+.table-responsive { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* ---------- Print ---------- */
+/* Used by the Print button on the Fines and Reports pages: strip the app
+   chrome so what comes out of the printer is just the report. */
+@media print {
+    .app-navbar,
+    .app-sidebar,
+    .app-offcanvas,
+    .app-footer,
+    .btn,
+    .form-control,
+    .form-select,
+    .form-check-input,
+    .notify-list,
+    .nav-tabs,
+    .btn-close { display: none !important; }
+
+    body { background: #fff; font-size: .8rem; }
+
+    .app-content { padding: 0 !important; margin: 0 !important; }
+
+    /* stop wide tables being clipped by their scroll container */
+    .table-responsive { overflow: visible !important; }
+    table { width: 100% !important; }
+
+    /* Bootstrap drops cell borders in print, so put them back */
+    .table > :not(caption) > * > * {
+        border-bottom: 1px solid #999 !important;
+        box-shadow: none !important;
+    }
+    .table thead th { background: #eee !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+    /* keep a row intact instead of splitting it across two sheets */
+    tr, thead { page-break-inside: avoid; break-inside: avoid; }
+    h1, h2, h3 { page-break-after: avoid; break-after: avoid; }
+
+    a[href]::after { content: ""; }   /* never print raw URLs */
+}
